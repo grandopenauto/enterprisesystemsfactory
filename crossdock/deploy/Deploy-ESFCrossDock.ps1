@@ -104,9 +104,51 @@ try {
     Out-Kv 'HEALTH_DETAIL' ($healthDetail -replace '[\r\n]+',' ')
     throw 'Deployment created but anonymous web-app health check did not pass.'
   }
-
   Out-Kv 'HEALTH_OK' '1'
-  Out-Kv 'RESULT' 'DEPLOYED'
+
+  # Prove the receiving dock end-to-end with one clearly identified internal QA manifest.
+  $qaDate = Get-Date -Format 'yyyyMMdd'
+  $qaSuffix = 'QA' + (([guid]::NewGuid().ToString('N')).Substring(0,6).ToUpperInvariant())
+  $qaManifestId = "ESF-$qaDate-$qaSuffix"
+  $qaForm = @{
+    manifest_id = $qaManifestId
+    customer_name = 'ESF CrossDock QA'
+    company = 'Highest Degree Priorities'
+    email = 'highestdegreepriorities@gmail.com'
+    phone = ''
+    preferred_path = 'build'
+    system_type = 'CrossDock receiver deployment QA'
+    current_state = 'deployment smoke test'
+    operating_outcome = 'Verify end-to-end Apps Script to ESF-CrossDock-Intake manifest receipt'
+    additional_context = 'Automated internal deployment smoke test. Safe QA record; not a customer lead.'
+    website = ''
+  }
+
+  $smokeOk = $false
+  $smokeDetail = ''
+  foreach ($attempt in 1..5) {
+    try {
+      $smoke = Invoke-WebRequest -Uri $webAppUrl -Method Post -Body $qaForm -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 30
+      $smokeDetail = [string]$smoke.Content
+      if ($smoke.StatusCode -eq 200 -and $smokeDetail -match '"ok":true' -and $smokeDetail -match [regex]::Escape($qaManifestId)) {
+        $smokeOk = $true
+        break
+      }
+    } catch {
+      $smokeDetail = $_.Exception.Message
+    }
+    Start-Sleep -Seconds 2
+  }
+
+  Out-Kv 'SMOKE_MANIFEST_ID' $qaManifestId
+  if (-not $smokeOk) {
+    Out-Kv 'SMOKE_OK' '0'
+    Out-Kv 'SMOKE_DETAIL' ($smokeDetail -replace '[\r\n]+',' ')
+    throw 'Web app deployed but end-to-end intake POST smoke test did not pass.'
+  }
+
+  Out-Kv 'SMOKE_OK' '1'
+  Out-Kv 'RESULT' 'DEPLOYED_AND_INTAKE_VERIFIED'
 } finally {
   Pop-Location
 }
