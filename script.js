@@ -1,7 +1,6 @@
 (() => {
   const LIVE_EMAIL = 'highestdegreepriorities@gmail.com';
-  // Filled with the verified Apps Script /exec URL after deployment smoke test.
-  const CROSSDOCK_ENDPOINT = '';
+  const CROSSDOCK_ENDPOINT = 'https://script.google.com/macros/s/AKfycbx_Qi8Tvr-MU-tM1qxb_3okRF0IRTnflWdEFEE1WhTkCdgvJqgHXXpo-V0ufTlQuHFk/exec';
 
   const track = (eventName, params = {}) => {
     if (typeof window.gtag === 'function') {
@@ -12,13 +11,11 @@
   const year = document.getElementById('year');
   if (year) year.textContent = new Date().getFullYear();
 
-  // Replace the retired contact mailbox anywhere it still appears in rendered UI.
   document.querySelectorAll('a[href^="mailto:contact@highestdegreepriorities.com"]').forEach(link => {
     link.href = link.href.replace('contact@highestdegreepriorities.com', LIVE_EMAIL);
     if ((link.textContent || '').trim() === 'contact@highestdegreepriorities.com') link.textContent = LIVE_EMAIL;
   });
 
-  // Keep structured data aligned with the live mailbox while the source HTML is migrated.
   document.querySelectorAll('script[type="application/ld+json"]').forEach(node => {
     if ((node.textContent || '').includes('contact@highestdegreepriorities.com')) {
       node.textContent = node.textContent.replaceAll('contact@highestdegreepriorities.com', LIVE_EMAIL);
@@ -71,7 +68,6 @@
   const submitButton = briefForm.querySelector('button[type="submit"]');
   const originalFormNote = briefForm.querySelector('.form-note');
 
-  // Add contact identity to the existing brief without requiring a source-HTML rewrite.
   if (!document.getElementById('customerName')) {
     const identity = document.createDocumentFragment();
 
