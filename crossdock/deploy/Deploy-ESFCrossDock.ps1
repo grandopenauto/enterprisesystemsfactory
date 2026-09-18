@@ -16,11 +16,11 @@ $claspCmd = Join-Path $toolRoot 'node_modules\.bin\clasp.cmd'
 
 function Out-Kv([string]$Key, [string]$Value) { Write-Output ("{0}={1}" -f $Key, $Value) }
 
-function Invoke-Native([string]$FilePath, [string[]]$Args) {
+function Invoke-Native([string]$FilePath, [string[]]$ArgumentList) {
   $prior = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    $output = (& $FilePath @Args 2>&1 | Out-String)
+    $output = (& $FilePath @ArgumentList 2>&1 | Out-String)
     $exitCode = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $prior
@@ -33,7 +33,8 @@ function Ensure-ClaspTool {
   New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
   New-Item -ItemType Directory -Force -Path $npmCache | Out-Null
   $npmCmd = (Get-Command npm.cmd -ErrorAction Stop).Source
-  $install = Invoke-Native $npmCmd @('install','--prefix',$toolRoot,'--cache',$npmCache,'--no-audit','--no-fund','@google/clasp@latest')
+  $installArgs = @('install','--prefix',$toolRoot,'--cache',$npmCache,'--no-audit','--no-fund','@google/clasp@latest')
+  $install = Invoke-Native $npmCmd $installArgs
   if ($install.ExitCode -ne 0 -or -not (Test-Path $claspCmd)) {
     throw "Stable clasp install failed: $($install.Output)"
   }
