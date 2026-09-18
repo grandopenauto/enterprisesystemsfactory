@@ -1,4 +1,6 @@
 (() => {
+  const LIVE_EMAIL = 'highestdegreepriorities@gmail.com';
+
   const track = (eventName, params = {}) => {
     if (typeof window.gtag === 'function') {
       window.gtag('event', eventName, params);
@@ -6,6 +8,17 @@
   };
 
   document.getElementById('year').textContent = new Date().getFullYear();
+
+  // Replace the retired contact mailbox in rendered contact links and structured data.
+  document.querySelectorAll('a[href^="mailto:contact@highestdegreepriorities.com"]').forEach(link => {
+    link.href = link.href.replace('contact@highestdegreepriorities.com', LIVE_EMAIL);
+    if ((link.textContent || '').trim() === 'contact@highestdegreepriorities.com') link.textContent = LIVE_EMAIL;
+  });
+  document.querySelectorAll('script[type="application/ld+json"]').forEach(node => {
+    if ((node.textContent || '').includes('contact@highestdegreepriorities.com')) {
+      node.textContent = node.textContent.replaceAll('contact@highestdegreepriorities.com', LIVE_EMAIL);
+    }
+  });
 
   const menuToggle = document.querySelector('.menu-toggle');
   const navLinks = document.querySelector('.nav-links');
@@ -131,7 +144,7 @@
     title.textContent = `${label} — starting recommendation`;
     text.textContent = brief;
     const subject = `ESF System Brief — ${label}`;
-    emailBrief.href = `mailto:contact@highestdegreepriorities.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(brief)}`;
+    emailBrief.href = `mailto:${LIVE_EMAIL}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(brief)}`;
     result.hidden = false;
     result.scrollIntoView({ behavior: 'smooth', block: 'center' });
 
