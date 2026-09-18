@@ -42,7 +42,8 @@ function Ensure-ClaspTool {
 
 function Invoke-Clasp([string[]]$ClaspArgs) {
   if (-not (Test-Path $claspCmd)) { throw 'Stable clasp command is missing.' }
-  return Invoke-Native $claspCmd @('-A',$claspRc) + $ClaspArgs
+  $allArgs = @('-A',$claspRc) + $ClaspArgs
+  return Invoke-Native $claspCmd $allArgs
 }
 
 Out-Kv 'SERVICE' 'ESF-CrossDock-Receiver'
