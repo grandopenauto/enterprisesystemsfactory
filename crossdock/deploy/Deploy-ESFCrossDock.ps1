@@ -10,22 +10,39 @@ $stateDir = Join-Path $RepoRoot 'crossdock\state'
 $deployDir = Join-Path $RepoRoot 'crossdock\deploy-work'
 $claspState = Join-Path $stateDir '.clasp.json'
 $claspRc = Join-Path $HOME '.clasprc.json'
+$toolRoot = 'C:\HDP\Tools\clasp'
+$npmCache = 'C:\HDP\Tools\npm-cache'
+$claspCmd = Join-Path $toolRoot 'node_modules\.bin\clasp.cmd'
 
 function Out-Kv([string]$Key, [string]$Value) { Write-Output ("{0}={1}" -f $Key, $Value) }
 
-function Invoke-Clasp([string[]]$ClaspArgs) {
+function Invoke-Native([string]$FilePath, [string[]]$Args) {
   $prior = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   try {
-    $output = (& npx --yes '@google/clasp' @ClaspArgs 2>&1 | Out-String)
+    $output = (& $FilePath @Args 2>&1 | Out-String)
     $exitCode = $LASTEXITCODE
   } finally {
     $ErrorActionPreference = $prior
   }
-  return [pscustomobject]@{
-    Output = $output
-    ExitCode = $exitCode
+  return [pscustomobject]@{ Output = $output; ExitCode = $exitCode }
+}
+
+function Ensure-ClaspTool {
+  if (Test-Path $claspCmd) { return }
+  New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
+  New-Item -ItemType Directory -Force -Path $npmCache | Out-Null
+  $npmCmd = (Get-Command npm.cmd -ErrorAction Stop).Source
+  $install = Invoke-Native $npmCmd @('install','--prefix',$toolRoot,'--cache',$npmCache,'--no-audit','--no-fund','@google/clasp@latest')
+  if ($install.ExitCode -ne 0 -or -not (Test-Path $claspCmd)) {
+    throw "Stable clasp install failed: $($install.Output)"
   }
+  Out-Kv 'CLASP_TOOL_BOOTSTRAPPED' '1'
+}
+
+function Invoke-Clasp([string[]]$ClaspArgs) {
+  if (-not (Test-Path $claspCmd)) { throw 'Stable clasp command is missing.' }
+  return Invoke-Native $claspCmd @('-A',$claspRc) + $ClaspArgs
 }
 
 Out-Kv 'SERVICE' 'ESF-CrossDock-Receiver'
@@ -35,17 +52,15 @@ Out-Kv 'EXTERNAL_CUSTOMER_ACTIONS' '0'
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js is required.' }
 $nodeMajor = [int]((node --version).TrimStart('v').Split('.')[0])
 if ($nodeMajor -lt 20) { throw 'Node.js 20 or newer is required.' }
-if (-not (Get-Command npx -ErrorAction SilentlyContinue)) { throw 'npx is required.' }
 if (-not (Test-Path $claspRc)) {
   Out-Kv 'AUTH_REQUIRED' '1'
   Out-Kv 'AUTH_REASON' 'clasp user OAuth credentials not found for the VPS service profile'
-  Out-Kv 'AUTH_COMMAND' 'npx --yes @google/clasp login --no-localhost'
-  Out-Kv 'APPS_SCRIPT_API_SETTING' 'https://script.google.com/home/usersettings'
   exit 20
 }
 if (-not (Test-Path (Join-Path $sourceDir 'Code.gs'))) { throw 'Approved Code.gs source is missing.' }
 if (-not (Test-Path (Join-Path $sourceDir 'appsscript.json'))) { throw 'Approved appsscript.json source is missing.' }
 
+Ensure-ClaspTool
 New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
 New-Item -ItemType Directory -Force -Path $deployDir | Out-Null
 
@@ -55,19 +70,19 @@ try {
   Out-Kv 'CLASP_VERSION' $claspVersionResult.Output.Trim()
   if ($claspVersionResult.ExitCode -ne 0) { throw "clasp version check failed: $($claspVersionResult.Output)" }
 
-  $authResult = Invoke-Clasp @('list-scripts')
+  $authResult = Invoke-Clasp @('show-authorized-user','--json')
   if ($authResult.ExitCode -ne 0) {
     Out-Kv 'AUTH_REQUIRED' '1'
     Out-Kv 'AUTH_REASON' 'stored clasp OAuth session is not usable'
     Out-Kv 'AUTH_DETAIL' ($authResult.Output -replace '[\r\n]+',' ')
-    Out-Kv 'AUTH_COMMAND' 'npx --yes @google/clasp login --no-localhost'
     exit 20
   }
+  Out-Kv 'AUTH_REQUIRED' '0'
 
   if (Test-Path $claspState) {
     Copy-Item $claspState (Join-Path $deployDir '.clasp.json') -Force
   } else {
-    $createResult = Invoke-Clasp @('create-script','--title',$ProjectTitle,'--type','webapp','--parentId',$SheetId)
+    $createResult = Invoke-Clasp @('create-script','--title',$ProjectTitle,'--parentId',$SheetId)
     if ($createResult.ExitCode -ne 0) { throw "clasp create-script failed: $($createResult.Output)" }
     if (-not (Test-Path (Join-Path $deployDir '.clasp.json'))) { throw 'clasp create-script did not produce .clasp.json.' }
     Copy-Item (Join-Path $deployDir '.clasp.json') $claspState -Force
@@ -94,7 +109,6 @@ try {
   $webAppUrl = "https://script.google.com/macros/s/{0}/exec" -f $deploymentId
   $scriptConfig = Get-Content (Join-Path $deployDir '.clasp.json') -Raw | ConvertFrom-Json
 
-  Out-Kv 'AUTH_REQUIRED' '0'
   Out-Kv 'SCRIPT_ID' ([string]$scriptConfig.scriptId)
   Out-Kv 'VERSION' $version
   Out-Kv 'DEPLOYMENT_ID' $deploymentId
