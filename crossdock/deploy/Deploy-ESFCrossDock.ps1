@@ -13,6 +13,21 @@ $claspRc = Join-Path $HOME '.clasprc.json'
 
 function Out-Kv([string]$Key, [string]$Value) { Write-Output ("{0}={1}" -f $Key, $Value) }
 
+function Invoke-Clasp([string[]]$ClaspArgs) {
+  $prior = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $output = (& npx --yes '@google/clasp' @ClaspArgs 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prior
+  }
+  return [pscustomobject]@{
+    Output = $output
+    ExitCode = $exitCode
+  }
+}
+
 Out-Kv 'SERVICE' 'ESF-CrossDock-Receiver'
 Out-Kv 'SHEET_ID' $SheetId
 Out-Kv 'EXTERNAL_CUSTOMER_ACTIONS' '0'
@@ -36,13 +51,15 @@ New-Item -ItemType Directory -Force -Path $deployDir | Out-Null
 
 Push-Location $deployDir
 try {
-  $claspVersion = (& npx --yes @google/clasp --version) 2>&1 | Out-String
-  Out-Kv 'CLASP_VERSION' $claspVersion.Trim()
+  $claspVersionResult = Invoke-Clasp @('--version')
+  Out-Kv 'CLASP_VERSION' $claspVersionResult.Output.Trim()
+  if ($claspVersionResult.ExitCode -ne 0) { throw "clasp version check failed: $($claspVersionResult.Output)" }
 
-  $authCheck = (& npx --yes @google/clasp list-scripts) 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) {
+  $authResult = Invoke-Clasp @('list-scripts')
+  if ($authResult.ExitCode -ne 0) {
     Out-Kv 'AUTH_REQUIRED' '1'
     Out-Kv 'AUTH_REASON' 'stored clasp OAuth session is not usable'
+    Out-Kv 'AUTH_DETAIL' ($authResult.Output -replace '[\r\n]+',' ')
     Out-Kv 'AUTH_COMMAND' 'npx --yes @google/clasp login --no-localhost'
     exit 20
   }
@@ -50,8 +67,8 @@ try {
   if (Test-Path $claspState) {
     Copy-Item $claspState (Join-Path $deployDir '.clasp.json') -Force
   } else {
-    $createOutput = (& npx --yes @google/clasp create-script --title $ProjectTitle --type webapp --parentId $SheetId) 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "clasp create-script failed: $createOutput" }
+    $createResult = Invoke-Clasp @('create-script','--title',$ProjectTitle,'--type','webapp','--parentId',$SheetId)
+    if ($createResult.ExitCode -ne 0) { throw "clasp create-script failed: $($createResult.Output)" }
     if (-not (Test-Path (Join-Path $deployDir '.clasp.json'))) { throw 'clasp create-script did not produce .clasp.json.' }
     Copy-Item (Join-Path $deployDir '.clasp.json') $claspState -Force
   }
@@ -59,19 +76,19 @@ try {
   Copy-Item (Join-Path $sourceDir 'Code.gs') (Join-Path $deployDir 'Code.gs') -Force
   Copy-Item (Join-Path $sourceDir 'appsscript.json') (Join-Path $deployDir 'appsscript.json') -Force
 
-  $pushOutput = (& npx --yes @google/clasp push --force) 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) { throw "clasp push failed: $pushOutput" }
+  $pushResult = Invoke-Clasp @('push','--force')
+  if ($pushResult.ExitCode -ne 0) { throw "clasp push failed: $($pushResult.Output)" }
 
-  $versionOutput = (& npx --yes @google/clasp create-version 'ESF CrossDock production') 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) { throw "clasp create-version failed: $versionOutput" }
-  $versionMatch = [regex]::Match($versionOutput, '(?i)version\D+(\d+)')
-  if (-not $versionMatch.Success) { throw "Could not determine Apps Script version from: $versionOutput" }
+  $versionResult = Invoke-Clasp @('create-version','ESF CrossDock production')
+  if ($versionResult.ExitCode -ne 0) { throw "clasp create-version failed: $($versionResult.Output)" }
+  $versionMatch = [regex]::Match($versionResult.Output, '(?i)version\D+(\d+)')
+  if (-not $versionMatch.Success) { throw "Could not determine Apps Script version from: $($versionResult.Output)" }
   $version = $versionMatch.Groups[1].Value
 
-  $deployOutput = (& npx --yes @google/clasp create-deployment --versionNumber $version --description 'ESF CrossDock production web app') 2>&1 | Out-String
-  if ($LASTEXITCODE -ne 0) { throw "clasp create-deployment failed: $deployOutput" }
-  $deploymentMatch = [regex]::Match($deployOutput, '(AKfy[a-zA-Z0-9_-]+)')
-  if (-not $deploymentMatch.Success) { throw "Could not determine deployment ID from: $deployOutput" }
+  $deployResult = Invoke-Clasp @('create-deployment','--versionNumber',$version,'--description','ESF CrossDock production web app')
+  if ($deployResult.ExitCode -ne 0) { throw "clasp create-deployment failed: $($deployResult.Output)" }
+  $deploymentMatch = [regex]::Match($deployResult.Output, '(AKfy[a-zA-Z0-9_-]+)')
+  if (-not $deploymentMatch.Success) { throw "Could not determine deployment ID from: $($deployResult.Output)" }
 
   $deploymentId = $deploymentMatch.Groups[1].Value
   $webAppUrl = "https://script.google.com/macros/s/{0}/exec" -f $deploymentId
