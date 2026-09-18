@@ -1,0 +1,186 @@
+param(
+  [string]$SheetId = '1_AyMgLDm7VkaxYxYBn4hRObx7nTqQmpLrPY1CyO_FOM',
+  [string]$ProjectTitle = 'ESF-CrossDock-Receiver',
+  [string]$RepoRoot = 'C:\HDP\EnterpriseSystemsFactory'
+)
+
+$ErrorActionPreference = 'Stop'
+$sourceDir = Join-Path $RepoRoot 'crossdock\apps-script'
+$stateDir = Join-Path $RepoRoot 'crossdock\state'
+$deployDir = Join-Path $RepoRoot 'crossdock\deploy-work'
+$claspState = Join-Path $stateDir '.clasp.json'
+$claspRc = Join-Path $HOME '.clasprc.json'
+$toolRoot = 'C:\HDP\Tools\clasp'
+$npmCache = 'C:\HDP\Tools\npm-cache'
+$claspCmd = Join-Path $toolRoot 'node_modules\.bin\clasp.cmd'
+
+function Out-Kv([string]$Key, [string]$Value) { Write-Output ("{0}={1}" -f $Key, $Value) }
+
+function Invoke-Native([string]$FilePath, [string[]]$ArgumentList) {
+  $prior = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $output = (& $FilePath @ArgumentList 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $prior
+  }
+  return [pscustomobject]@{ Output = $output; ExitCode = $exitCode }
+}
+
+function Ensure-ClaspTool {
+  if (Test-Path $claspCmd) { return }
+  New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
+  New-Item -ItemType Directory -Force -Path $npmCache | Out-Null
+  $npmCmd = (Get-Command npm.cmd -ErrorAction Stop).Source
+  $installArgs = @('install','--prefix',$toolRoot,'--cache',$npmCache,'--no-audit','--no-fund','@google/clasp@latest')
+  $install = Invoke-Native $npmCmd $installArgs
+  if ($install.ExitCode -ne 0 -or -not (Test-Path $claspCmd)) {
+    throw "Stable clasp install failed: $($install.Output)"
+  }
+  Out-Kv 'CLASP_TOOL_BOOTSTRAPPED' '1'
+}
+
+function Invoke-Clasp([string[]]$ClaspArgs) {
+  if (-not (Test-Path $claspCmd)) { throw 'Stable clasp command is missing.' }
+  $allArgs = @('-A',$claspRc) + $ClaspArgs
+  return Invoke-Native $claspCmd $allArgs
+}
+
+Out-Kv 'SERVICE' 'ESF-CrossDock-Receiver'
+Out-Kv 'SHEET_ID' $SheetId
+Out-Kv 'EXTERNAL_CUSTOMER_ACTIONS' '0'
+
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js is required.' }
+$nodeMajor = [int]((node --version).TrimStart('v').Split('.')[0])
+if ($nodeMajor -lt 20) { throw 'Node.js 20 or newer is required.' }
+if (-not (Test-Path $claspRc)) {
+  Out-Kv 'AUTH_REQUIRED' '1'
+  Out-Kv 'AUTH_REASON' 'clasp user OAuth credentials not found for the VPS service profile'
+  exit 20
+}
+if (-not (Test-Path (Join-Path $sourceDir 'Code.gs'))) { throw 'Approved Code.gs source is missing.' }
+if (-not (Test-Path (Join-Path $sourceDir 'appsscript.json'))) { throw 'Approved appsscript.json source is missing.' }
+
+Ensure-ClaspTool
+New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+New-Item -ItemType Directory -Force -Path $deployDir | Out-Null
+
+Push-Location $deployDir
+try {
+  $claspVersionResult = Invoke-Clasp @('--version')
+  Out-Kv 'CLASP_VERSION' $claspVersionResult.Output.Trim()
+  if ($claspVersionResult.ExitCode -ne 0) { throw "clasp version check failed: $($claspVersionResult.Output)" }
+
+  $authResult = Invoke-Clasp @('show-authorized-user','--json')
+  if ($authResult.ExitCode -ne 0) {
+    Out-Kv 'AUTH_REQUIRED' '1'
+    Out-Kv 'AUTH_REASON' 'stored clasp OAuth session is not usable'
+    Out-Kv 'AUTH_DETAIL' ($authResult.Output -replace '[\r\n]+',' ')
+    exit 20
+  }
+  Out-Kv 'AUTH_REQUIRED' '0'
+
+  if (Test-Path $claspState) {
+    Copy-Item $claspState (Join-Path $deployDir '.clasp.json') -Force
+  } else {
+    $createResult = Invoke-Clasp @('create-script','--title',$ProjectTitle,'--parentId',$SheetId)
+    if ($createResult.ExitCode -ne 0) { throw "clasp create-script failed: $($createResult.Output)" }
+    if (-not (Test-Path (Join-Path $deployDir '.clasp.json'))) { throw 'clasp create-script did not produce .clasp.json.' }
+    Copy-Item (Join-Path $deployDir '.clasp.json') $claspState -Force
+  }
+
+  Copy-Item (Join-Path $sourceDir 'Code.gs') (Join-Path $deployDir 'Code.gs') -Force
+  Copy-Item (Join-Path $sourceDir 'appsscript.json') (Join-Path $deployDir 'appsscript.json') -Force
+
+  $pushResult = Invoke-Clasp @('push','--force')
+  if ($pushResult.ExitCode -ne 0) { throw "clasp push failed: $($pushResult.Output)" }
+
+  $versionResult = Invoke-Clasp @('create-version','ESF CrossDock production')
+  if ($versionResult.ExitCode -ne 0) { throw "clasp create-version failed: $($versionResult.Output)" }
+  $versionMatch = [regex]::Match($versionResult.Output, '(?i)version\D+(\d+)')
+  if (-not $versionMatch.Success) { throw "Could not determine Apps Script version from: $($versionResult.Output)" }
+  $version = $versionMatch.Groups[1].Value
+
+  $deployResult = Invoke-Clasp @('create-deployment','--versionNumber',$version,'--description','ESF CrossDock production web app')
+  if ($deployResult.ExitCode -ne 0) { throw "clasp create-deployment failed: $($deployResult.Output)" }
+  $deploymentMatch = [regex]::Match($deployResult.Output, '(AKfy[a-zA-Z0-9_-]+)')
+  if (-not $deploymentMatch.Success) { throw "Could not determine deployment ID from: $($deployResult.Output)" }
+
+  $deploymentId = $deploymentMatch.Groups[1].Value
+  $webAppUrl = "https://script.google.com/macros/s/{0}/exec" -f $deploymentId
+  $scriptConfig = Get-Content (Join-Path $deployDir '.clasp.json') -Raw | ConvertFrom-Json
+
+  Out-Kv 'SCRIPT_ID' ([string]$scriptConfig.scriptId)
+  Out-Kv 'VERSION' $version
+  Out-Kv 'DEPLOYMENT_ID' $deploymentId
+  Out-Kv 'WEB_APP_URL' $webAppUrl
+
+  $healthOk = $false
+  $healthDetail = ''
+  foreach ($attempt in 1..5) {
+    try {
+      $response = Invoke-WebRequest -Uri $webAppUrl -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 20
+      $healthDetail = [string]$response.Content
+      if ($response.StatusCode -eq 200 -and $healthDetail -match 'ESF-CrossDock-Receiver' -and $healthDetail -match '"status":"ready"') {
+        $healthOk = $true
+        break
+      }
+    } catch {
+      $healthDetail = $_.Exception.Message
+    }
+    Start-Sleep -Seconds 2
+  }
+
+  if (-not $healthOk) {
+    Out-Kv 'HEALTH_OK' '0'
+    Out-Kv 'HEALTH_DETAIL' ($healthDetail -replace '[\r\n]+',' ')
+    throw 'Deployment created but anonymous web-app health check did not pass.'
+  }
+  Out-Kv 'HEALTH_OK' '1'
+
+  $qaDate = Get-Date -Format 'yyyyMMdd'
+  $qaSuffix = 'QA' + (([guid]::NewGuid().ToString('N')).Substring(0,6).ToUpperInvariant())
+  $qaManifestId = "ESF-$qaDate-$qaSuffix"
+  $qaForm = @{
+    manifest_id = $qaManifestId
+    customer_name = 'ESF CrossDock QA'
+    company = 'Highest Degree Priorities'
+    email = 'highestdegreepriorities@gmail.com'
+    phone = ''
+    preferred_path = 'build'
+    system_type = 'CrossDock receiver deployment QA'
+    current_state = 'deployment smoke test'
+    operating_outcome = 'Verify end-to-end Apps Script to ESF-CrossDock-Intake manifest receipt'
+    additional_context = 'Automated internal deployment smoke test. Safe QA record; not a customer lead.'
+    website = ''
+  }
+
+  $smokeOk = $false
+  $smokeDetail = ''
+  foreach ($attempt in 1..5) {
+    try {
+      $smoke = Invoke-WebRequest -Uri $webAppUrl -Method Post -Body $qaForm -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 30
+      $smokeDetail = [string]$smoke.Content
+      if ($smoke.StatusCode -eq 200 -and $smokeDetail -match '"ok":true' -and $smokeDetail -match [regex]::Escape($qaManifestId)) {
+        $smokeOk = $true
+        break
+      }
+    } catch {
+      $smokeDetail = $_.Exception.Message
+    }
+    Start-Sleep -Seconds 2
+  }
+
+  Out-Kv 'SMOKE_MANIFEST_ID' $qaManifestId
+  if (-not $smokeOk) {
+    Out-Kv 'SMOKE_OK' '0'
+    Out-Kv 'SMOKE_DETAIL' ($smokeDetail -replace '[\r\n]+',' ')
+    throw 'Web app deployed but end-to-end intake POST smoke test did not pass.'
+  }
+
+  Out-Kv 'SMOKE_OK' '1'
+  Out-Kv 'RESULT' 'DEPLOYED_AND_INTAKE_VERIFIED'
+} finally {
+  Pop-Location
+}
