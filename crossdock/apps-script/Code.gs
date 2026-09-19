@@ -7,6 +7,8 @@ const ESF = Object.freeze({
   timeZone: 'America/Los_Angeles',
   maxPostBytes: 16384,
   lockWaitMs: 30000,
+  recentReplayWindowMs: 120000,
+  recentReplayScanRows: 100,
   manifestIdPattern: /^ESF-\d{8}-[A-Z0-9]{8}$/,
   allowedPaths: ['build', 'build-operate', 'operate']
 });
@@ -102,7 +104,7 @@ function doPost(e) {
         ]);
 
         // Commit the protected Sheet writes before releasing the lock so the
-        // next concurrent request sees the manifest ID we just reserved.
+        // next concurrent request sees the manifest we just reserved.
         SpreadsheetApp.flush();
       }
     } finally {
@@ -181,17 +183,48 @@ function safeCell_(value) {
 function resolveManifest_(sheet, candidate, now, prefix, clean, suggestedPath) {
   if (candidate) {
     const found = sheet.getRange('A:A').createTextFinder(candidate).matchEntireCell(true).findNext();
-    if (!found) {
-      return {manifestId: candidate, replay: false, receivedAt: ''};
-    }
-
-    const existing = sheet.getRange(found.getRow(), 1, 1, 19).getDisplayValues()[0];
-    if (sameManifestPayload_(existing, clean, suggestedPath)) {
-      return {manifestId: candidate, replay: true, receivedAt: String(existing[1] || '')};
+    if (found) {
+      const existing = sheet.getRange(found.getRow(), 1, 1, 19).getDisplayValues()[0];
+      if (sameManifestPayload_(existing, clean, suggestedPath)) {
+        return {manifestId: candidate, replay: true, receivedAt: String(existing[1] || '')};
+      }
     }
   }
 
+  // Browser retries and rapid double-clicks may carry a fresh client-side ID.
+  // Treat an otherwise identical payload received moments ago as the same job.
+  const recent = recentMatchingManifest_(sheet, clean, suggestedPath, now);
+  if (recent) return recent;
+
+  if (candidate) {
+    const found = sheet.getRange('A:A').createTextFinder(candidate).matchEntireCell(true).findNext();
+    if (!found) return {manifestId: candidate, replay: false, receivedAt: ''};
+  }
+
   return {manifestId: newUniqueManifestId_(sheet, now, prefix), replay: false, receivedAt: ''};
+}
+
+function recentMatchingManifest_(sheet, clean, suggestedPath, now) {
+  const last = sheet.getLastRow();
+  if (last < 2) return null;
+  const count = Math.min(ESF.recentReplayScanRows, last - 1);
+  const startRow = last - count + 1;
+  const rows = sheet.getRange(startRow, 1, count, 19).getDisplayValues();
+  const cutoff = now.getTime() - ESF.recentReplayWindowMs;
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    const when = new Date(String(row[1] || ''));
+    if (isNaN(when.getTime()) || when.getTime() < cutoff) continue;
+    if (sameManifestPayload_(row, clean, suggestedPath)) {
+      return {
+        manifestId: String(row[0] || ''),
+        replay: true,
+        receivedAt: String(row[1] || '')
+      };
+    }
+  }
+  return null;
 }
 
 function sameManifestPayload_(row, clean, suggestedPath) {
