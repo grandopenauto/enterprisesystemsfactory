@@ -6,6 +6,7 @@ const ESF = Object.freeze({
   configSheet: 'Config',
   timeZone: 'America/Los_Angeles',
   maxPostBytes: 16384,
+  lockWaitMs: 30000,
   manifestIdPattern: /^ESF-\d{8}-[A-Z0-9]{8}$/,
   allowedPaths: ['build', 'build-operate', 'operate']
 });
@@ -14,7 +15,7 @@ function doGet() {
   return json_({
     ok: true,
     service: 'ESF-CrossDock-Receiver',
-    version: '1.0.0',
+    version: '1.1.0',
     status: 'ready'
   });
 }
@@ -37,56 +38,96 @@ function doPost(e) {
 
     const clean = validateAndSanitize_(payload);
     const lock = LockService.getScriptLock();
-    lock.waitLock(10000);
+    lock.waitLock(ESF.lockWaitMs);
+
+    let manifestId = '';
+    let stamp = '';
+    let notifyTo = '';
+    let replay = false;
+    let suggestedPath = '';
+
     try {
       const ss = SpreadsheetApp.openById(ESF.spreadsheetId);
       const manifests = requiredSheet_(ss, ESF.manifestsSheet);
       const events = requiredSheet_(ss, ESF.eventsSheet);
       const cfg = config_(ss);
 
-      const manifestId = uniqueManifestId_(manifests, clean.manifest_id, receivedAt, cfg.manifest_prefix || 'ESF');
-      const stamp = Utilities.formatDate(receivedAt, ESF.timeZone, "yyyy-MM-dd'T'HH:mm:ssXXX");
-      const suggestedPath = suggestedProductionPath_(clean.preferred_path);
+      suggestedPath = suggestedProductionPath_(clean.preferred_path);
+      const decision = resolveManifest_(
+        manifests,
+        clean.manifest_id,
+        receivedAt,
+        cfg.manifest_prefix || 'ESF',
+        clean,
+        suggestedPath
+      );
 
-      manifests.appendRow([
-        safeCell_(manifestId),
-        safeCell_(stamp),
-        'NEW',
-        safeCell_(cfg.source || 'enterprisesystemsfactory.com'),
-        safeCell_(clean.customer_name),
-        safeCell_(clean.company),
-        safeCell_(clean.email),
-        safeCell_(clean.phone),
-        safeCell_(clean.preferred_path),
-        safeCell_(clean.system_type),
-        safeCell_(clean.current_state),
-        safeCell_(clean.operating_outcome),
-        safeCell_(clean.additional_context),
-        safeCell_(suggestedPath),
-        'PENDING',
-        '',
-        '',
-        'Review new intake',
-        safeCell_(stamp)
-      ]);
+      manifestId = decision.manifestId;
+      replay = decision.replay;
+      stamp = decision.receivedAt || Utilities.formatDate(receivedAt, ESF.timeZone, "yyyy-MM-dd'T'HH:mm:ssXXX");
+      notifyTo = cfg.notification_email || '';
 
-      const eventId = 'EVT-' + Utilities.getUuid().replace(/-/g, '').slice(0, 12).toUpperCase();
-      events.appendRow([
-        eventId,
-        manifestId,
-        stamp,
-        'RECEIVED',
-        'ESF-CrossDock-Receiver',
-        '',
-        'NEW',
-        'Public system brief accepted into receiving dock.'
-      ]);
+      if (!replay) {
+        manifests.appendRow([
+          safeCell_(manifestId),
+          safeCell_(stamp),
+          'NEW',
+          safeCell_(cfg.source || 'enterprisesystemsfactory.com'),
+          safeCell_(clean.customer_name),
+          safeCell_(clean.company),
+          safeCell_(clean.email),
+          safeCell_(clean.phone),
+          safeCell_(clean.preferred_path),
+          safeCell_(clean.system_type),
+          safeCell_(clean.current_state),
+          safeCell_(clean.operating_outcome),
+          safeCell_(clean.additional_context),
+          safeCell_(suggestedPath),
+          'PENDING',
+          '',
+          '',
+          'Review new intake',
+          safeCell_(stamp)
+        ]);
 
-      notify_(cfg.notification_email, manifestId, clean, stamp);
-      return json_({ok: true, accepted: true, manifest_id: manifestId, received_at: stamp});
+        events.appendRow([
+          eventId_(),
+          manifestId,
+          stamp,
+          'RECEIVED',
+          'ESF-CrossDock-Receiver',
+          '',
+          'NEW',
+          'Public system brief accepted into receiving dock.'
+        ]);
+
+        // Commit the protected Sheet writes before releasing the lock so the
+        // next concurrent request sees the manifest ID we just reserved.
+        SpreadsheetApp.flush();
+      }
     } finally {
       lock.releaseLock();
     }
+
+    // Notifications are deliberately outside the Sheet lock. A slow or failed
+    // email must never block another customer from obtaining the intake lock,
+    // and it must never turn an already-accepted manifest into a failed submit.
+    if (!replay && notifyTo && !isInternalQa_(clean)) {
+      try {
+        notify_(notifyTo, manifestId, clean, stamp);
+      } catch (notifyErr) {
+        recordNotificationFailure_(manifestId, notifyErr, new Date());
+        console.error(notifyErr && notifyErr.stack ? notifyErr.stack : notifyErr);
+      }
+    }
+
+    return json_({
+      ok: true,
+      accepted: true,
+      manifest_id: manifestId,
+      received_at: stamp,
+      replay: replay
+    });
   } catch (err) {
     try {
       quarantine_('receiver_error:' + safeReason_(err && err.message), raw, receivedAt);
@@ -137,12 +178,45 @@ function safeCell_(value) {
   return /^[=+\-@]/.test(s) ? "'" + s : s;
 }
 
-function uniqueManifestId_(sheet, candidate, now, prefix) {
-  let id = candidate || newManifestId_(now, prefix);
-  for (let i = 0; i < 4; i++) {
+function resolveManifest_(sheet, candidate, now, prefix, clean, suggestedPath) {
+  if (candidate) {
+    const found = sheet.getRange('A:A').createTextFinder(candidate).matchEntireCell(true).findNext();
+    if (!found) {
+      return {manifestId: candidate, replay: false, receivedAt: ''};
+    }
+
+    const existing = sheet.getRange(found.getRow(), 1, 1, 19).getDisplayValues()[0];
+    if (sameManifestPayload_(existing, clean, suggestedPath)) {
+      return {manifestId: candidate, replay: true, receivedAt: String(existing[1] || '')};
+    }
+  }
+
+  return {manifestId: newUniqueManifestId_(sheet, now, prefix), replay: false, receivedAt: ''};
+}
+
+function sameManifestPayload_(row, clean, suggestedPath) {
+  if (!row || row.length < 14) return false;
+  const expected = [
+    safeCell_(clean.customer_name),
+    safeCell_(clean.company),
+    safeCell_(clean.email),
+    safeCell_(clean.phone),
+    safeCell_(clean.preferred_path),
+    safeCell_(clean.system_type),
+    safeCell_(clean.current_state),
+    safeCell_(clean.operating_outcome),
+    safeCell_(clean.additional_context),
+    safeCell_(suggestedPath)
+  ];
+  const actual = row.slice(4, 14).map(String);
+  return expected.every(function(value, i) { return String(value) === actual[i]; });
+}
+
+function newUniqueManifestId_(sheet, now, prefix) {
+  for (let i = 0; i < 5; i++) {
+    const id = newManifestId_(now, prefix);
     const found = sheet.getRange('A:A').createTextFinder(id).matchEntireCell(true).findNext();
     if (!found) return id;
-    id = newManifestId_(now, prefix);
   }
   throw new Error('manifest_id_collision');
 }
@@ -197,12 +271,52 @@ function notify_(to, manifestId, clean, stamp) {
   });
 }
 
+function isInternalQa_(clean) {
+  return clean && clean.customer_name === 'ESF CrossDock QA' &&
+    clean.email === 'highestdegreepriorities@gmail.com' &&
+    String(clean.additional_context || '').toLowerCase().indexOf('not a customer lead') >= 0;
+}
+
+function recordNotificationFailure_(manifestId, err, when) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return;
+  try {
+    const ss = SpreadsheetApp.openById(ESF.spreadsheetId);
+    const events = requiredSheet_(ss, ESF.eventsSheet);
+    const stamp = Utilities.formatDate(when || new Date(), ESF.timeZone, "yyyy-MM-dd'T'HH:mm:ssXXX");
+    events.appendRow([
+      eventId_(),
+      manifestId,
+      stamp,
+      'NOTIFICATION_FAILED',
+      'ESF-CrossDock-Receiver',
+      '',
+      'ACCEPTED',
+      safeReason_(err && err.message)
+    ]);
+  } catch (_) {
+    // Intake is already durable. Notification telemetry must remain best-effort.
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function eventId_() {
+  return 'EVT-' + Utilities.getUuid().replace(/-/g, '').slice(0, 12).toUpperCase();
+}
+
 function quarantine_(reason, raw, when) {
-  const ss = SpreadsheetApp.openById(ESF.spreadsheetId);
-  const sheet = requiredSheet_(ss, ESF.quarantineSheet);
-  const stamp = Utilities.formatDate(when || new Date(), ESF.timeZone, "yyyy-MM-dd'T'HH:mm:ssXXX");
-  const excerpt = String(raw || '').replace(/[\u0000-\u001F\u007F]/g, ' ').slice(0, 500);
-  sheet.appendRow([stamp, safeCell_(safeReason_(reason)), 'enterprisesystemsfactory.com', safeCell_(excerpt), 'NEW']);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(ESF.lockWaitMs);
+  try {
+    const ss = SpreadsheetApp.openById(ESF.spreadsheetId);
+    const sheet = requiredSheet_(ss, ESF.quarantineSheet);
+    const stamp = Utilities.formatDate(when || new Date(), ESF.timeZone, "yyyy-MM-dd'T'HH:mm:ssXXX");
+    const excerpt = String(raw || '').replace(/[\u0000-\u001F\u007F]/g, ' ').slice(0, 500);
+    sheet.appendRow([stamp, safeCell_(safeReason_(reason)), 'enterprisesystemsfactory.com', safeCell_(excerpt), 'NEW']);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function safeReason_(value) {
