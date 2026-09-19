@@ -17,7 +17,7 @@ function doGet() {
   return json_({
     ok: true,
     service: 'ESF-CrossDock-Receiver',
-    version: '1.1.0',
+    version: '1.1.1',
     status: 'ready'
   });
 }
@@ -103,8 +103,6 @@ function doPost(e) {
           'Public system brief accepted into receiving dock.'
         ]);
 
-        // Commit the protected Sheet writes before releasing the lock so the
-        // next concurrent request sees the manifest we just reserved.
         SpreadsheetApp.flush();
       }
     } finally {
@@ -114,7 +112,7 @@ function doPost(e) {
     // Notifications are deliberately outside the Sheet lock. A slow or failed
     // email must never block another customer from obtaining the intake lock,
     // and it must never turn an already-accepted manifest into a failed submit.
-    if (!replay && notifyTo && !isInternalQa_(clean)) {
+    if (!replay && notifyTo) {
       try {
         notify_(notifyTo, manifestId, clean, stamp);
       } catch (notifyErr) {
@@ -191,8 +189,6 @@ function resolveManifest_(sheet, candidate, now, prefix, clean, suggestedPath) {
     }
   }
 
-  // Browser retries and rapid double-clicks may carry a fresh client-side ID.
-  // Treat an otherwise identical payload received moments ago as the same job.
   const recent = recentMatchingManifest_(sheet, clean, suggestedPath, now);
   if (recent) return recent;
 
@@ -302,12 +298,6 @@ function notify_(to, manifestId, clean, stamp) {
     body: body,
     name: 'Enterprise Systems Factory'
   });
-}
-
-function isInternalQa_(clean) {
-  return clean && clean.customer_name === 'ESF CrossDock QA' &&
-    clean.email === 'highestdegreepriorities@gmail.com' &&
-    String(clean.additional_context || '').toLowerCase().indexOf('not a customer lead') >= 0;
 }
 
 function recordNotificationFailure_(manifestId, err, when) {
